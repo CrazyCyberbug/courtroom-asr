@@ -1,28 +1,57 @@
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
-from datasets import load_from_disk
+import os
 import torch
 import evaluate
-import os
+from datasets import load_dataset, Audio
+from datasets import load_from_disk, save_to_disk
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
+from core.trainer import (compute_metrics,
+                          add_data_augmentation,
+                          ds_normalize_map,
+                          prepare_features,
+                          train_test_split) 
+
+
+
+# ── prepare data ───────────────────────────────────────────────────────
+
+# modify these
 CHECKPOINT_DIR = "/content/drive/MyDrive/asr_checkpoints_latest"
 train_path = "/content/drive/MyDrive/whisper_data/train_features"
 test_path  = "/content/drive/MyDrive/whisper_data/test_features"
 
+ds = load_dataset("CrazyCyberBug2/courtroom-asr-improved-chunking", split="train")
+ds = ds.cast_column("audio", Audio(sampling_rate=16000))
 
-DRIVE_PATH = "/content/drive"
-if not os.path.exists(DRIVE_PATH):
-    from google.colab import drive
-    drive.mount(DRIVE_PATH)
+# filtering dataset
+ds = ds.filter(
+    lambda x: x["duration"] >= 1.0 and x['duration']<=40.0 and 0.9 <= x["confidence"] <= 1.4,
+    num_proc=4
+)
+
+ds = ds_normalize_map(ds)
+ds_augmented = add_data_augmentation(ds)
+ds_train_split, ds_test_split = train_test_split(ds_augmented)
 
 
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-print("Checkpoint directory:", CHECKPOINT_DIR)
+
+ds_train = ds_train_split.map(
+    prepare_features,
+    num_proc=1
+)
 
 
+ds_test = ds_test_split.map(
+    prepare_features,
+    num_proc=1
 
-ds_train = load_from_disk(train_path)
-ds_test  = load_from_disk(test_path)
+)
+
+ds_train.save_to_disk(train_path)
+ds_test.save_to_disk(test_path)
+
+
 
 # ── setup model ───────────────────────────────────────────────────────
 
@@ -34,19 +63,21 @@ model.generation_config.suppress_tokens = []
 model.generation_config.language = "en"
 model.generation_config.task = "transcribe"
 
-# Keep only the columns the trainer needs — drop audio/text/duration to prevent
-# the dataloader from pulling large raw columns into RAM each batch
+
 KEEP_COLS = {"input_features", "labels"}
 ds_train = ds_train.remove_columns([c for c in ds_train.column_names if c not in KEEP_COLS])
 ds_test  = ds_test.remove_columns([c for c in ds_test.column_names  if c not in KEEP_COLS])
 
-# Tell HuggingFace datasets to memory-map rather than cache in RAM
-ds_train = ds_train.with_format("numpy")   # keeps Arrow mmap; avoids Python-list copies
+
+ds_train = ds_train.with_format("numpy")  
 ds_test  = ds_test.with_format("numpy")
 
 print(f"Train: {len(ds_train):,} examples | Eval: {len(ds_test):,} examples")
 
-# ── Collator ──────────────────────────────────────────────────────────────────
+
+# ── Defining collator ───────────────────────────────────────────────────────
+
+
 class WhisperCollator:
     def __call__(self, batch):
         input_features = torch.stack([
@@ -62,20 +93,11 @@ class WhisperCollator:
 
 data_collator = WhisperCollator()
 
-# ── WER metric ────────────────────────────────────────────────────────────────
-wer_metric = evaluate.load("wer")
+def call_compute_metrics(pred):
+    return compute_metrics(pred, processor)
 
-def compute_metrics(pred):
-    pred_ids  = pred.predictions
-    label_ids = pred.label_ids
-    # Replace padding token so the decoder doesn't choke on -100
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-    pred_str  = processor.tokenizer.batch_decode(pred_ids,  skip_special_tokens=True)
-    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": round(wer, 4)}
+# ── setup trainer ───────────────────────────────────────────────────────
 
-# ── Training arguments ────────────────────────────────────────────────────────
 training_args = Seq2SeqTrainingArguments(
     output_dir=CHECKPOINT_DIR,
 
@@ -113,7 +135,6 @@ training_args = Seq2SeqTrainingArguments(
     report_to="none",
 )
 
-# ── Trainer ───────────────────────────────────────────────────────────────────
 trainer = Seq2SeqTrainer(
     model=model,
     args=training_args,
@@ -123,7 +144,7 @@ trainer = Seq2SeqTrainer(
     compute_metrics=compute_metrics,
 )
 
-# ── Resume from latest checkpoint if one exists ───────────────────────────────
+# Resume from latest checkpoint if one exists
 checkpoint = None
 if os.path.exists(CHECKPOINT_DIR):
     checkpoints = [f for f in os.listdir(CHECKPOINT_DIR) if "checkpoint" in f]
@@ -133,5 +154,7 @@ if os.path.exists(CHECKPOINT_DIR):
         
         
 if __name__ == "__main__":
+    
+# ── training loop ───────────────────────────────────────────────────────
 
     trainer.train(resume_from_checkpoint=checkpoint)
