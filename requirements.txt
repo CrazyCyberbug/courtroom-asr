@@ -1,0 +1,14 @@
+pdfplumber
+pymupdf
+audiomentations
+evaluate
+num2words
+torch
+torchaudio 
+datasets
+numpy
+whisper-openai
+transformers
+silero-vad
+faster-whisper
+git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git
